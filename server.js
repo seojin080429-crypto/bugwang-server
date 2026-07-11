@@ -18,6 +18,11 @@ const sb = createClient(
 const NAVER_ID     = process.env.NAVER_CLIENT_ID;
 const NAVER_SECRET = process.env.NAVER_CLIENT_SECRET;
 const GEMINI_KEY   = process.env.GEMINI_API_KEY;
+const NEIS_KEY     = process.env.NEIS_API_KEY;
+
+// 부광고등학교 (인천광역시교육청) — NEIS 학교기본정보에서 확인한 고정값
+const NEIS_OFCDC_CODE = 'E10';
+const NEIS_SCHUL_CODE = 'E100000215';
 
 // ── HTTP 요청 헬퍼 ──
 function httpGet(options) {
@@ -191,6 +196,83 @@ function scheduleDaily() {
   }, delay);
 }
 
+// ── NEIS 급식 정보 수집 ──
+function ymdToday(offsetDays = 0) {
+  const d = new Date();
+  d.setDate(d.getDate() + offsetDays);
+  return d.toISOString().slice(0, 10).replace(/-/g, '');
+}
+
+async function neisMealFetch(ymd) {
+  const path = `/hub/mealServiceDietInfo?ATPT_OFCDC_SC_CODE=${NEIS_OFCDC_CODE}&SD_SCHUL_CODE=${NEIS_SCHUL_CODE}&MLSV_YMD=${ymd}&Type=json&KEY=${NEIS_KEY}`;
+  const data = await httpGet({
+    hostname: 'open.neis.go.kr',
+    path,
+    method: 'GET',
+  });
+  return JSON.parse(data);
+}
+
+// DDISH_NM 예: "쌀밥1.5.6.<br/>된장찌개5.6.9.<br/>..." → 줄 단위로 분리 (알레르기 번호는 그대로 유지)
+function parseMenuText(ddishNm) {
+  return (ddishNm || '')
+    .split(/<br\s*\/?>/i)
+    .map(s => s.trim())
+    .filter(Boolean);
+}
+
+async function fetchAndSaveMeal(ymd) {
+  ymd = ymd || ymdToday();
+  if (!NEIS_KEY) { console.error('NEIS_API_KEY가 설정되지 않았습니다'); return { ok: false, error: 'NEIS_API_KEY 미설정' }; }
+  console.log('급식 수집 시작:', ymd);
+  try {
+    const json = await neisMealFetch(ymd);
+    if (json?.RESULT?.CODE === 'INFO-200') {
+      console.log('해당 날짜 급식 정보 없음(주말/방학 등):', ymd);
+      return { ok: true, count: 0 };
+    }
+    const rows = json?.mealServiceDietInfo?.[1]?.row || [];
+    if (!rows.length) { console.log('급식 데이터 없음:', ymd); return { ok: true, count: 0 }; }
+
+    const meals = rows.map(r => ({
+      date: `${r.MLSV_YMD.slice(0,4)}-${r.MLSV_YMD.slice(4,6)}-${r.MLSV_YMD.slice(6,8)}`,
+      meal_type: r.MMEAL_SC_NM,          // 조식/중식/석식
+      menu: parseMenuText(r.DDISH_NM),
+      calorie: r.CAL_INFO || null,
+      origin_info: r.ORPLC_INFO ? parseMenuText(r.ORPLC_INFO) : null,
+    }));
+
+    const { error } = await sb.from('meals').upsert(meals, { onConflict: 'date,meal_type' });
+    if (error) { console.error('급식 저장 실패:', error.message); return { ok: false, error: error.message }; }
+    console.log(`급식 저장 완료 (${ymd}): ${meals.length}건`);
+    return { ok: true, count: meals.length };
+  } catch(e) {
+    console.error('급식 수집 실패:', e.message);
+    return { ok: false, error: e.message };
+  }
+}
+
+// 매일 오늘 급식 + 앞으로 6일치(이번 주) 미리 수집
+async function fetchAndSaveMealWeek() {
+  for (let i = 0; i < 7; i++) {
+    await fetchAndSaveMeal(ymdToday(i));
+  }
+}
+
+// ── 급식 스케줄러 (매일 오전 6시 KST = UTC 21시) ──
+function scheduleMealDaily() {
+  const now = new Date();
+  const next = new Date();
+  next.setUTCHours(21, 0, 0, 0);
+  if (next <= now) next.setUTCDate(next.getUTCDate() + 1);
+  const delay = next - now;
+  console.log(`다음 급식 수집: ${next.toLocaleString('ko-KR')} (${Math.round(delay/60000)}분 후)`);
+  setTimeout(() => {
+    fetchAndSaveMealWeek();
+    setInterval(fetchAndSaveMealWeek, 24 * 60 * 60 * 1000);
+  }, delay);
+}
+
 // ── 관리자 권한 확인 미들웨어 ──
 async function requireAdmin(req, res, next) {
   const { student_id } = req.body;
@@ -203,6 +285,12 @@ async function requireAdmin(req, res, next) {
   req.callerRole = role;
   next();
 }
+
+// ── API: 급식 수동 수집 (이번 주 전체) ──
+app.post('/api/fetch-meal', requireAdmin, async (req, res) => {
+  fetchAndSaveMealWeek().catch(console.error);
+  res.json({ success: true, message: '급식 정보 수집을 시작했습니다 (이번 주)' });
+});
 
 // ── API: 뉴스 수동 수집 ──
 app.post('/api/fetch-news', requireAdmin, async (req, res) => {
@@ -277,4 +365,6 @@ app.listen(PORT, () => {
   console.log(`부광 서버 실행 중 :${PORT}`);
   scheduleDaily();
   fetchAndSaveNews().catch(console.error);
+  scheduleMealDaily();
+  fetchAndSaveMealWeek().catch(console.error);
 });
