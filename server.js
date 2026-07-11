@@ -66,37 +66,62 @@ function stripHtml(str) {
 
 // ── Gemini 요약 ──
 async function summarizeWithGemini(articles) {
-  const articleText = articles.map((a,i) =>
-    `${i+1}. [${a.category}] ${a.title}\n설명: ${a.source||'없음'}`
-  ).join('\n\n');
+  const articleText = articles.slice(0, 10).map((a,i) =>
+    `${i+1}. [${a.category}] ${a.title}`
+  ).join('\n');
 
-  const prompt = `당신은 고3 수험생을 위한 입시 뉴스 큐레이터입니다.
-아래 오늘의 입시 뉴스 목록을 읽고, 수험생에게 꼭 필요한 핵심 정보를 친근하고 명확하게 요약해주세요.
+  const prompt = `고3 수험생을 위한 오늘의 입시 뉴스 요약을 작성해주세요.
 
-[오늘의 입시 뉴스]
+[뉴스 목록]
 ${articleText}
 
-다음 형식으로 작성해주세요:
-- 전체 뉴스를 2~3문장으로 오늘의 핵심 요약 (수험생 눈높이로)
-- 각 뉴스별 한 줄 핵심 포인트
+위 뉴스를 바탕으로:
+1. 전체 요약 (2문장, 수험생 눈높이로 친근하게)
+2. 주목할 뉴스 3개 한 줄 핵심
 
-답변은 한국어로, 친근하고 간결하게 작성해주세요.`;
+한국어로 간결하게 작성해주세요.`;
 
   try {
     const body = JSON.stringify({
       contents: [{ parts: [{ text: prompt }] }],
-      generationConfig: { maxOutputTokens: 1024, temperature: 0.4 }
+      generationConfig: { maxOutputTokens: 512, temperature: 0.3 }
     });
 
-    const data = await httpPost({
-      hostname: 'generativelanguage.googleapis.com',
-      path: `/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_KEY}`,
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
-    }, body);
+    // timeout 30초 설정
+    const timeoutPromise = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error('Gemini timeout')), 30000)
+    );
 
+    const fetchPromise = new Promise((resolve, reject) => {
+      const req = https.request({
+        hostname: 'generativelanguage.googleapis.com',
+        path: `/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_KEY}`,
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(body)
+        }
+      }, res => {
+        let data = '';
+        res.on('data', chunk => data += chunk);
+        res.on('end', () => resolve(data));
+      });
+      req.on('error', reject);
+      req.write(body);
+      req.end();
+    });
+
+    const data = await Promise.race([fetchPromise, timeoutPromise]);
     const result = JSON.parse(data);
-    return result?.candidates?.[0]?.content?.parts?.[0]?.text || null;
+
+    if(result.error) {
+      console.error('Gemini API 에러:', result.error.message);
+      return null;
+    }
+
+    const text = result?.candidates?.[0]?.content?.parts?.[0]?.text;
+    console.log('Gemini 요약 완료:', text?.slice(0,50));
+    return text || null;
   } catch(e) {
     console.error('Gemini 요약 실패:', e.message);
     return null;
