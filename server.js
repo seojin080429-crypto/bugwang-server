@@ -344,7 +344,7 @@ app.post('/api/create-user', requireAdmin, async (req, res) => {
   if (req.callerRole !== 'owner') return res.status(403).json({ error: '운영자만 계정을 생성할 수 있습니다' });
   const { target_student_id, password = '1234' } = req.body;
   if (!target_student_id) return res.status(400).json({ error: '학번이 없습니다' });
-  if (!/^\d{5}$/.test(target_student_id)) return res.status(400).json({ error: '학번은 5자리 숫자여야 합니다' });
+  if (!/^\d{5}$/.test(target_student_id) && target_student_id !== 'teacher') return res.status(400).json({ error: '학번은 5자리 숫자 또는 teacher여야 합니다' });
   const email = `${target_student_id}@bugwang3-1.app`;
   const { data, error } = await sb.auth.admin.createUser({
     email, password, email_confirm: true,
