@@ -17,12 +17,12 @@ const sb = createClient(
 
 const NAVER_ID     = process.env.NAVER_CLIENT_ID;
 const NAVER_SECRET = process.env.NAVER_CLIENT_SECRET;
-const GROQ_KEY     = process.env.GROQ_API_KEY;
+const GEMINI_KEY   = process.env.GEMINI_API_KEY;
 const NEIS_KEY     = process.env.NEIS_API_KEY;
 
-// 부광고등학교 (인천광역시교육청) — NEIS 학교기본정보에서 확인한 고정값
-const NEIS_OFCDC_CODE = 'E10';
-const NEIS_SCHUL_CODE = 'E100000215';
+// 학교 정보
+const SCHOOL_CODE = 'E100000215'; // 부광고등학교
+const EDU_CODE    = 'J10';        // 인천광역시교육청
 
 // ── HTTP 요청 헬퍼 ──
 function httpGet(options) {
@@ -69,8 +69,8 @@ function stripHtml(str) {
   return (str||'').replace(/<[^>]*>/g, '').replace(/&quot;/g,'"').replace(/&amp;/g,'&').replace(/&#039;/g,"'").trim();
 }
 
-// ── Groq 요약 ──
-async function summarizeWithGroq(articles) {
+// ── Gemini 요약 ──
+async function summarizeWithGemini(articles) {
   const articleText = articles.slice(0, 10).map((a,i) =>
     `${i+1}. [${a.category}] ${a.title}`
   ).join('\n');
@@ -84,28 +84,26 @@ ${articleText}
 1. 전체 요약 (2문장, 수험생 눈높이로 친근하게)
 2. 주목할 뉴스 3개 한 줄 핵심
 
-한국어로 간결하게 작성해주세요. 이모지나 특수문자는 사용하지 마세요.`;
+한국어로 간결하게 작성해주세요.`;
 
   try {
     const body = JSON.stringify({
-      model: 'llama-3.3-70b-versatile',
-      messages: [{ role: 'user', content: prompt }],
-      max_tokens: 512,
-      temperature: 0.3
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: { maxOutputTokens: 512, temperature: 0.3 }
     });
 
+    // timeout 30초 설정
     const timeoutPromise = new Promise((_, reject) =>
-      setTimeout(() => reject(new Error('Groq timeout')), 30000)
+      setTimeout(() => reject(new Error('Gemini timeout')), 30000)
     );
 
     const fetchPromise = new Promise((resolve, reject) => {
       const req = https.request({
-        hostname: 'api.groq.com',
-        path: '/openai/v1/chat/completions',
+        hostname: 'generativelanguage.googleapis.com',
+        path: `/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_KEY}`,
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${GROQ_KEY}`,
           'Content-Length': Buffer.byteLength(body)
         }
       }, res => {
@@ -122,15 +120,15 @@ ${articleText}
     const result = JSON.parse(data);
 
     if(result.error) {
-      console.error('Groq API 에러:', result.error.message);
+      console.error('Gemini API 에러:', result.error.message);
       return null;
     }
 
-    const text = result?.choices?.[0]?.message?.content;
-    console.log('Groq 요약 완료:', text?.slice(0,50));
+    const text = result?.candidates?.[0]?.content?.parts?.[0]?.text;
+    console.log('Gemini 요약 완료:', text?.slice(0,50));
     return text || null;
   } catch(e) {
-    console.error('Groq 요약 실패:', e.message);
+    console.error('Gemini 요약 실패:', e.message);
     return null;
   }
 }
@@ -170,20 +168,13 @@ async function fetchAndSaveNews() {
   }
 
   if (allNews.length > 0) {
-    // URL 기준 중복 제거
-    const seen = new Set();
-    const deduped = allNews.filter(n => {
-      if(seen.has(n.url)) return false;
-      seen.add(n.url);
-      return true;
-    });
-    const { error } = await sb.from('news').insert(deduped);
+    const { error } = await sb.from('news').insert(allNews);
     if (error) console.error('뉴스 DB 저장 실패:', error.message);
-    else console.log(`뉴스 ${deduped.length}개 저장 완료 (중복 ${allNews.length - deduped.length}개 제거)`);
+    else console.log(`뉴스 ${allNews.length}개 저장 완료`);
 
-    // Groq로 요약 생성
-    console.log('Groq 요약 생성 중...');
-    const summary = await summarizeWithGroq(deduped);
+    // Gemini로 요약 생성
+    console.log('Gemini 요약 생성 중...');
+    const summary = await summarizeWithGemini(allNews);
     if (summary) {
       await sb.from('news_summary').insert({ summary, date: today });
       console.log('요약 저장 완료');
@@ -205,83 +196,6 @@ function scheduleDaily() {
   }, delay);
 }
 
-// ── NEIS 급식 정보 수집 ──
-function ymdToday(offsetDays = 0) {
-  const d = new Date();
-  d.setDate(d.getDate() + offsetDays);
-  return d.toISOString().slice(0, 10).replace(/-/g, '');
-}
-
-async function neisMealFetch(ymd) {
-  const path = `/hub/mealServiceDietInfo?ATPT_OFCDC_SC_CODE=${NEIS_OFCDC_CODE}&SD_SCHUL_CODE=${NEIS_SCHUL_CODE}&MLSV_YMD=${ymd}&Type=json&KEY=${NEIS_KEY}`;
-  const data = await httpGet({
-    hostname: 'open.neis.go.kr',
-    path,
-    method: 'GET',
-  });
-  return JSON.parse(data);
-}
-
-// DDISH_NM 예: "쌀밥1.5.6.<br/>된장찌개5.6.9.<br/>..." → 줄 단위로 분리 (알레르기 번호는 그대로 유지)
-function parseMenuText(ddishNm) {
-  return (ddishNm || '')
-    .split(/<br\s*\/?>/i)
-    .map(s => s.trim())
-    .filter(Boolean);
-}
-
-async function fetchAndSaveMeal(ymd) {
-  ymd = ymd || ymdToday();
-  if (!NEIS_KEY) { console.error('NEIS_API_KEY가 설정되지 않았습니다'); return { ok: false, error: 'NEIS_API_KEY 미설정' }; }
-  console.log('급식 수집 시작:', ymd);
-  try {
-    const json = await neisMealFetch(ymd);
-    if (json?.RESULT?.CODE === 'INFO-200') {
-      console.log('해당 날짜 급식 정보 없음(주말/방학 등):', ymd);
-      return { ok: true, count: 0 };
-    }
-    const rows = json?.mealServiceDietInfo?.[1]?.row || [];
-    if (!rows.length) { console.log('급식 데이터 없음:', ymd); return { ok: true, count: 0 }; }
-
-    const meals = rows.map(r => ({
-      date: `${r.MLSV_YMD.slice(0,4)}-${r.MLSV_YMD.slice(4,6)}-${r.MLSV_YMD.slice(6,8)}`,
-      meal_type: r.MMEAL_SC_NM,          // 조식/중식/석식
-      menu: parseMenuText(r.DDISH_NM),
-      calorie: r.CAL_INFO || null,
-      origin_info: r.ORPLC_INFO ? parseMenuText(r.ORPLC_INFO) : null,
-    }));
-
-    const { error } = await sb.from('meals').upsert(meals, { onConflict: 'date,meal_type' });
-    if (error) { console.error('급식 저장 실패:', error.message); return { ok: false, error: error.message }; }
-    console.log(`급식 저장 완료 (${ymd}): ${meals.length}건`);
-    return { ok: true, count: meals.length };
-  } catch(e) {
-    console.error('급식 수집 실패:', e.message);
-    return { ok: false, error: e.message };
-  }
-}
-
-// 매일 오늘 급식 + 앞으로 6일치(이번 주) 미리 수집
-async function fetchAndSaveMealWeek() {
-  for (let i = 0; i < 7; i++) {
-    await fetchAndSaveMeal(ymdToday(i));
-  }
-}
-
-// ── 급식 스케줄러 (매일 오전 6시 KST = UTC 21시) ──
-function scheduleMealDaily() {
-  const now = new Date();
-  const next = new Date();
-  next.setUTCHours(21, 0, 0, 0);
-  if (next <= now) next.setUTCDate(next.getUTCDate() + 1);
-  const delay = next - now;
-  console.log(`다음 급식 수집: ${next.toLocaleString('ko-KR')} (${Math.round(delay/60000)}분 후)`);
-  setTimeout(() => {
-    fetchAndSaveMealWeek();
-    setInterval(fetchAndSaveMealWeek, 24 * 60 * 60 * 1000);
-  }, delay);
-}
-
 // ── 관리자 권한 확인 미들웨어 ──
 async function requireAdmin(req, res, next) {
   const { student_id } = req.body;
@@ -294,12 +208,6 @@ async function requireAdmin(req, res, next) {
   req.callerRole = role;
   next();
 }
-
-// ── API: 급식 수동 수집 (이번 주 전체) ──
-app.post('/api/fetch-meal', requireAdmin, async (req, res) => {
-  fetchAndSaveMealWeek().catch(console.error);
-  res.json({ success: true, message: '급식 정보 수집을 시작했습니다 (이번 주)' });
-});
 
 // ── API: 뉴스 수동 수집 ──
 app.post('/api/fetch-news', requireAdmin, async (req, res) => {
@@ -344,7 +252,7 @@ app.post('/api/create-user', requireAdmin, async (req, res) => {
   if (req.callerRole !== 'owner') return res.status(403).json({ error: '운영자만 계정을 생성할 수 있습니다' });
   const { target_student_id, password = '1234' } = req.body;
   if (!target_student_id) return res.status(400).json({ error: '학번이 없습니다' });
-  if (!/^\d{5}$/.test(target_student_id) && target_student_id !== 'teacher') return res.status(400).json({ error: '학번은 5자리 숫자 또는 teacher여야 합니다' });
+  if (!/^\d{5}$/.test(target_student_id)) return res.status(400).json({ error: '학번은 5자리 숫자여야 합니다' });
   const email = `${target_student_id}@bugwang3-1.app`;
   const { data, error } = await sb.auth.admin.createUser({
     email, password, email_confirm: true,
@@ -369,11 +277,45 @@ app.post('/api/delete-user', requireAdmin, async (req, res) => {
   res.json({ success: true, message: `${target_student_id}번 계정이 삭제되었습니다` });
 });
 
+// ── API: 급식 정보 ──
+app.get('/api/meal', async (req, res) => {
+  try {
+    const date = req.query.date || new Date().toISOString().slice(0,10).replace(/-/g,'');
+    const url = `https://open.neis.go.kr/hub/mealServiceDietInfo?Type=json&pIndex=1&pSize=10&ATPT_OFCDC_SC_CODE=${EDU_CODE}&SD_SCHUL_CODE=${SCHOOL_CODE}&MLSV_YMD=${date}&KEY=${NEIS_KEY}`;
+
+    const data = await new Promise((resolve, reject) => {
+      https.get(url, r => {
+        let d = '';
+        r.on('data', chunk => d += chunk);
+        r.on('end', () => resolve(d));
+      }).on('error', reject);
+    });
+
+    const json = JSON.parse(data);
+
+    // 급식 없는 날
+    if (json.RESULT?.CODE === 'INFO-000' || !json.mealServiceDietInfo) {
+      return res.json({ meals: [] });
+    }
+
+    const rows = json.mealServiceDietInfo[1]?.row || [];
+    const meals = rows.map(r => ({
+      type: r.MMEAL_SC_NM,   // 조식/중식/석식
+      menu: r.DISH_NM.split('<br/>').map(s => s.replace(/\d+\./g,'').trim()).filter(Boolean),
+      cal: r.CAL_INFO,
+      allergy: r.ORPLC_INFO
+    }));
+
+    res.json({ meals, date });
+  } catch(e) {
+    console.error('급식 API 오류:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`부광 서버 실행 중 :${PORT}`);
   scheduleDaily();
   fetchAndSaveNews().catch(console.error);
-  scheduleMealDaily();
-  fetchAndSaveMealWeek().catch(console.error);
 });
