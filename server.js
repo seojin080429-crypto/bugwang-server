@@ -1355,7 +1355,7 @@ async function doLogin(){
   const id=document.getElementById('login-id').value.trim();
   const pw=document.getElementById('login-pw').value;
   if(!id||!pw){showAuthErr('학번과 비밀번호를 모두 입력하세요.');return}
-  if(!/^\d{5}$/.test(id)){showAuthErr('학번은 5자리 숫자입니다.');return}
+  if(!/^\d{5}$/.test(id)&&id!=='teacher'){showAuthErr('학번은 5자리 숫자 또는 teacher입니다.');return}
   document.getElementById('login-btn').textContent='로그인 중...';
   const {data,error}=await sb.auth.signInWithPassword({email:`${id}@bugwang3-1.app`,password:pw});
   if(error){showAuthErr('학번 또는 비밀번호가 올바르지 않습니다.');document.getElementById('login-btn').textContent='로그인';return}
