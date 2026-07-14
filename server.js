@@ -17,7 +17,7 @@ const sb = createClient(
 
 const NAVER_ID     = process.env.NAVER_CLIENT_ID;
 const NAVER_SECRET = process.env.NAVER_CLIENT_SECRET;
-const GEMINI_KEY   = process.env.GEMINI_API_KEY;
+const GROQ_KEY     = process.env.GROQ_API_KEY;
 const NEIS_KEY     = process.env.NEIS_API_KEY;
 
 // 학교 정보
@@ -69,8 +69,8 @@ function stripHtml(str) {
   return (str||'').replace(/<[^>]*>/g, '').replace(/&quot;/g,'"').replace(/&amp;/g,'&').replace(/&#039;/g,"'").trim();
 }
 
-// ── Gemini 요약 ──
-async function summarizeWithGemini(articles) {
+// ── Groq 요약 ──
+async function summarizeWithGroq(articles) {
   const articleText = articles.slice(0, 10).map((a,i) =>
     `${i+1}. [${a.category}] ${a.title}`
   ).join('\n');
@@ -88,22 +88,25 @@ ${articleText}
 
   try {
     const body = JSON.stringify({
-      contents: [{ parts: [{ text: prompt }] }],
-      generationConfig: { maxOutputTokens: 512, temperature: 0.3 }
+      model: 'llama-3.3-70b-versatile',
+      messages: [{ role: 'user', content: prompt }],
+      max_tokens: 512,
+      temperature: 0.3
     });
 
     // timeout 30초 설정
     const timeoutPromise = new Promise((_, reject) =>
-      setTimeout(() => reject(new Error('Gemini timeout')), 30000)
+      setTimeout(() => reject(new Error('Groq timeout')), 30000)
     );
 
     const fetchPromise = new Promise((resolve, reject) => {
       const req = https.request({
-        hostname: 'generativelanguage.googleapis.com',
-        path: `/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_KEY}`,
+        hostname: 'api.groq.com',
+        path: '/openai/v1/chat/completions',
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
+          'Authorization': `Bearer ${GROQ_KEY}`,
           'Content-Length': Buffer.byteLength(body)
         }
       }, res => {
@@ -120,15 +123,15 @@ ${articleText}
     const result = JSON.parse(data);
 
     if(result.error) {
-      console.error('Gemini API 에러:', result.error.message);
+      console.error('Groq API 에러:', result.error.message);
       return null;
     }
 
-    const text = result?.candidates?.[0]?.content?.parts?.[0]?.text;
-    console.log('Gemini 요약 완료:', text?.slice(0,50));
+    const text = result?.choices?.[0]?.message?.content;
+    console.log('Groq 요약 완료:', text?.slice(0,50));
     return text || null;
   } catch(e) {
-    console.error('Gemini 요약 실패:', e.message);
+    console.error('Groq 요약 실패:', e.message);
     return null;
   }
 }
@@ -172,9 +175,9 @@ async function fetchAndSaveNews() {
     if (error) console.error('뉴스 DB 저장 실패:', error.message);
     else console.log(`뉴스 ${allNews.length}개 저장 완료`);
 
-    // Gemini로 요약 생성
-    console.log('Gemini 요약 생성 중...');
-    const summary = await summarizeWithGemini(allNews);
+    // Groq로 요약 생성
+    console.log('Groq 요약 생성 중...');
+    const summary = await summarizeWithGroq(allNews);
     if (summary) {
       await sb.from('news_summary').insert({ summary, date: today });
       console.log('요약 저장 완료');
