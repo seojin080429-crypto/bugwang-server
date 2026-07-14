@@ -21,8 +21,8 @@ const GROQ_KEY     = process.env.GROQ_API_KEY;
 const NEIS_KEY     = process.env.NEIS_API_KEY;
 
 // 학교 정보
-const SCHOOL_CODE = 'E100000215'; // 부광고등학교
-const EDU_CODE    = 'J10';        // 인천광역시교육청
+const SCHOOL_CODE = '7310046'; // 부광고등학교
+const EDU_CODE    = 'E10';     // 인천광역시교육청
 
 // ── HTTP 요청 헬퍼 ──
 function httpGet(options) {
@@ -321,7 +321,7 @@ async function fetchMealForDate(d) {
   return rows.map(r => ({
     date: ymd(d, '-'),
     meal_type: r.MMEAL_SC_NM, // 조식/중식/석식
-    menu: r.DISH_NM.split('<br/>').map(s => s.replace(/\d+\./g, '').trim()).filter(Boolean),
+    menu: r.DDISH_NM.split('<br/>').map(s => s.replace(/\([^)]*\)/g, '').replace(/\d+\./g, '').trim()).filter(Boolean),
   }));
 }
 
@@ -359,27 +359,6 @@ function scheduleDailyMeal() {
     setInterval(fetchAndSaveMeal, 24 * 60 * 60 * 1000);
   }, delay);
 }
-
-// ── TEMP DEBUG: NEIS 원본 응답 확인용 (진단 후 제거 예정) ──
-app.get('/api/meal-debug', async (req, res) => {
-  const date = req.query.date || ymd(kstDate());
-  const eduCode = req.query.edu || EDU_CODE;
-  const schoolCode = req.query.school || SCHOOL_CODE;
-  const url = `https://open.neis.go.kr/hub/mealServiceDietInfo?Type=json&pIndex=1&pSize=10&ATPT_OFCDC_SC_CODE=${eduCode}&SD_SCHUL_CODE=${schoolCode}&MLSV_YMD=${date}&KEY=${NEIS_KEY ? '(set, len=' + NEIS_KEY.length + ')' : '(MISSING)'}`;
-  const realUrl = `https://open.neis.go.kr/hub/mealServiceDietInfo?Type=json&pIndex=1&pSize=10&ATPT_OFCDC_SC_CODE=${eduCode}&SD_SCHUL_CODE=${schoolCode}&MLSV_YMD=${date}&KEY=${NEIS_KEY}`;
-  try {
-    const data = await new Promise((resolve, reject) => {
-      https.get(realUrl, r => {
-        let body = '';
-        r.on('data', chunk => body += chunk);
-        r.on('end', () => resolve(body));
-      }).on('error', reject);
-    });
-    res.json({ requestedUrl: url, date, keyPresent: !!NEIS_KEY, neisResponse: JSON.parse(data) });
-  } catch (e) {
-    res.status(500).json({ error: e.message, requestedUrl: url });
-  }
-});
 
 // ── API: 급식 수동 수집 ──
 app.post('/api/fetch-meal', requireAdmin, async (req, res) => {
