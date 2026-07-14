@@ -435,6 +435,16 @@ function makeJaasToken(user) {
   });
 }
 
+// ── TEMP DEBUG: JaaS 환경변수 설정 여부만 확인 (값은 노출 안 함, 진단 후 제거 예정) ──
+app.get('/api/study/debug', (req, res) => {
+  res.json({
+    appIdSet: !!JAAS_APP_ID,
+    apiKeySet: !!JAAS_API_KEY,
+    privateKeySet: !!JAAS_PRIVATE_KEY,
+    privateKeyLooksValid: JAAS_PRIVATE_KEY.startsWith('-----BEGIN'),
+  });
+});
+
 // ── API: 캠스터디 입장 (영상 토큰 발급) ──
 app.post('/api/study/join', requireStudySession, async (req, res) => {
   if (!JAAS_APP_ID || !JAAS_API_KEY || !JAAS_PRIVATE_KEY) {
