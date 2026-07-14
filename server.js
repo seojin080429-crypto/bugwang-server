@@ -363,8 +363,10 @@ function scheduleDailyMeal() {
 // ── TEMP DEBUG: NEIS 원본 응답 확인용 (진단 후 제거 예정) ──
 app.get('/api/meal-debug', async (req, res) => {
   const date = req.query.date || ymd(kstDate());
-  const url = `https://open.neis.go.kr/hub/mealServiceDietInfo?Type=json&pIndex=1&pSize=10&ATPT_OFCDC_SC_CODE=${EDU_CODE}&SD_SCHUL_CODE=${SCHOOL_CODE}&MLSV_YMD=${date}&KEY=${NEIS_KEY ? '(set, len=' + NEIS_KEY.length + ')' : '(MISSING)'}`;
-  const realUrl = `https://open.neis.go.kr/hub/mealServiceDietInfo?Type=json&pIndex=1&pSize=10&ATPT_OFCDC_SC_CODE=${EDU_CODE}&SD_SCHUL_CODE=${SCHOOL_CODE}&MLSV_YMD=${date}&KEY=${NEIS_KEY}`;
+  const eduCode = req.query.edu || EDU_CODE;
+  const schoolCode = req.query.school || SCHOOL_CODE;
+  const url = `https://open.neis.go.kr/hub/mealServiceDietInfo?Type=json&pIndex=1&pSize=10&ATPT_OFCDC_SC_CODE=${eduCode}&SD_SCHUL_CODE=${schoolCode}&MLSV_YMD=${date}&KEY=${NEIS_KEY ? '(set, len=' + NEIS_KEY.length + ')' : '(MISSING)'}`;
+  const realUrl = `https://open.neis.go.kr/hub/mealServiceDietInfo?Type=json&pIndex=1&pSize=10&ATPT_OFCDC_SC_CODE=${eduCode}&SD_SCHUL_CODE=${schoolCode}&MLSV_YMD=${date}&KEY=${NEIS_KEY}`;
   try {
     const data = await new Promise((resolve, reject) => {
       https.get(realUrl, r => {
