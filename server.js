@@ -394,9 +394,9 @@ async function requireStudySession(req, res, next) {
   if (error || !data?.user) return res.status(401).json({ error: '세션이 만료되었습니다. 다시 로그인해주세요' });
   const studentId = data.user.email.split('@')[0];
   const nickname = data.user.user_metadata?.display_name || studentId;
-  const { data: roleRow } = await sb.from('user_roles').select('role').eq('student_id', studentId).single();
+  const { data: roleRow } = await sb.from('user_roles').select('role, cam_allowed').eq('student_id', studentId).single();
   const role = roleRow?.role || 'student';
-  req.studyUser = { studentId, nickname, role };
+  req.studyUser = { studentId, nickname, role, camAllowed: !!roleRow?.cam_allowed };
   next();
 }
 
@@ -435,20 +435,13 @@ function makeJaasToken(user) {
   });
 }
 
-// ── TEMP DEBUG: JaaS 환경변수 설정 여부만 확인 (값은 노출 안 함, 진단 후 제거 예정) ──
-app.get('/api/study/debug', (req, res) => {
-  res.json({
-    appIdSet: !!JAAS_APP_ID,
-    apiKeySet: !!JAAS_API_KEY,
-    privateKeySet: !!JAAS_PRIVATE_KEY,
-    privateKeyLooksValid: JAAS_PRIVATE_KEY.startsWith('-----BEGIN'),
-  });
-});
-
 // ── API: 캠스터디 입장 (영상 토큰 발급) ──
 app.post('/api/study/join', requireStudySession, async (req, res) => {
   if (!JAAS_APP_ID || !JAAS_API_KEY || !JAAS_PRIVATE_KEY) {
     return res.status(500).json({ error: '영상 서버 설정이 아직 안 됐어요. 관리자에게 문의해주세요.' });
+  }
+  if (!isStaffRole(req.studyUser.role) && !req.studyUser.camAllowed) {
+    return res.status(403).json({ error: '캠스터디 이용이 허용되지 않은 계정이에요. 선생님/관리자에게 신청해주세요.' });
   }
   const token = makeJaasToken(req.studyUser);
   res.json({
