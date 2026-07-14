@@ -265,6 +265,7 @@ app.post('/api/users', requireAdmin, async (req, res) => {
   const filtered = users.users
     .filter(u => u.email?.endsWith('@bugwang3-1.app'))
     .map(u => ({
+      id: u.id,
       student_id: u.email.split('@')[0],
       name: u.user_metadata?.display_name || null,
       suneung_kor: u.user_metadata?.suneung_kor || null,
@@ -278,7 +279,7 @@ app.post('/api/users', requireAdmin, async (req, res) => {
 
 // ── API: 계정 생성 ──
 app.post('/api/create-user', requireAdmin, async (req, res) => {
-  if (!['owner', 'teacher'].includes(req.callerRole)) return res.status(403).json({ error: '운영자/교사만 계정을 생성할 수 있습니다' });
+  if (!req.callerIsOwnerTier) return res.status(403).json({ error: '운영자/교사만 계정을 생성할 수 있습니다' });
   const { target_student_id, password = '1234' } = req.body;
   if (!target_student_id) return res.status(400).json({ error: '아이디가 없습니다' });
   if (!/^[a-zA-Z0-9_-]{2,30}$/.test(target_student_id)) return res.status(400).json({ error: '아이디는 영문/숫자/-/_ 2~30자여야 합니다' });
