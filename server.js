@@ -2,11 +2,16 @@ const express = require('express');
 const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
 const https = require('https');
+const http = require('http');
+const { Server } = require('socket.io');
+const jwt = require('jsonwebtoken');
+
+const CORS_ORIGINS = ['https://seojin080429-crypto.github.io', 'http://localhost:3000'];
 
 const app = express();
 app.use(express.json());
 app.use(cors({
-  origin: ['https://seojin080429-crypto.github.io', 'http://localhost:3000'],
+  origin: CORS_ORIGINS,
   credentials: true
 }));
 
@@ -19,6 +24,12 @@ const NAVER_ID     = process.env.NAVER_CLIENT_ID;
 const NAVER_SECRET = process.env.NAVER_CLIENT_SECRET;
 const GROQ_KEY     = process.env.GROQ_API_KEY;
 const NEIS_KEY     = process.env.NEIS_API_KEY;
+
+// ── 캠스터디 영상통화 (JaaS / 8x8.vc) ──
+const JAAS_APP_ID      = process.env.JAAS_APP_ID;
+const JAAS_API_KEY     = process.env.JAAS_API_KEY;
+const JAAS_PRIVATE_KEY = (process.env.JAAS_PRIVATE_KEY || '').replace(/\\n/g, '\n');
+const STUDY_ROOM        = 'main-camstudy';
 
 // 학교 정보
 const SCHOOL_CODE = '7310046'; // 부광고등학교
@@ -370,8 +381,155 @@ app.post('/api/fetch-meal', requireAdmin, async (req, res) => {
   }
 });
 
+// ═══════════════════════════════════════════
+// 캠스터디 (화상 자습방)
+// ═══════════════════════════════════════════
+
+// ── 로그인 세션 확인 미들웨어 (Supabase access_token 검증) ──
+async function requireStudySession(req, res, next) {
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+  if (!token) return res.status(401).json({ error: '로그인이 필요합니다' });
+  const { data, error } = await sb.auth.getUser(token);
+  if (error || !data?.user) return res.status(401).json({ error: '세션이 만료되었습니다. 다시 로그인해주세요' });
+  const studentId = data.user.email.split('@')[0];
+  const nickname = data.user.user_metadata?.display_name || studentId;
+  const { data: roleRow } = await sb.from('user_roles').select('role').eq('student_id', studentId).single();
+  const role = roleRow?.role || 'student';
+  req.studyUser = { studentId, nickname, role };
+  next();
+}
+
+function isStaffRole(role) { return role === 'admin' || role === 'owner'; }
+
+// JaaS(Jitsi) 입장권(JWT) 생성 — RS256, Private Key로 서명
+function makeJaasToken(user) {
+  const now = Math.floor(Date.now() / 1000);
+  const moderator = isStaffRole(user.role);
+  const payload = {
+    aud: 'jitsi',
+    iss: 'chat',
+    sub: JAAS_APP_ID,
+    room: '*',
+    exp: now + 3 * 60 * 60,
+    nbf: now - 10,
+    context: {
+      user: {
+        id: user.studentId,
+        name: user.nickname,
+        avatar: '',
+        email: '',
+        moderator: moderator ? 'true' : 'false',
+      },
+      features: {
+        livestreaming: 'false',
+        recording: 'false',
+        transcription: 'false',
+        'outbound-call': 'false',
+      },
+    },
+  };
+  return jwt.sign(payload, JAAS_PRIVATE_KEY, {
+    algorithm: 'RS256',
+    header: { kid: JAAS_API_KEY, typ: 'JWT' },
+  });
+}
+
+// ── API: 캠스터디 입장 (영상 토큰 발급) ──
+app.post('/api/study/join', requireStudySession, async (req, res) => {
+  if (!JAAS_APP_ID || !JAAS_API_KEY || !JAAS_PRIVATE_KEY) {
+    return res.status(500).json({ error: '영상 서버 설정이 아직 안 됐어요. 관리자에게 문의해주세요.' });
+  }
+  const token = makeJaasToken(req.studyUser);
+  res.json({
+    token,
+    appId: JAAS_APP_ID,
+    room: STUDY_ROOM,
+    moderator: isStaffRole(req.studyUser.role),
+  });
+});
+
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
+const server = http.createServer(app);
+const io = new Server(server, {
+  cors: { origin: CORS_ORIGINS, credentials: true },
+  pingTimeout: 90000,
+  pingInterval: 25000,
+});
+
+// ── Socket.IO: 채팅 + 참가자 목록 (영상 자체는 JaaS가 담당) ──
+const studyParticipants = new Map();
+
+io.use(async (socket, next) => {
+  const token = socket.handshake.auth?.token;
+  if (!token) return next(new Error('인증 실패'));
+  const { data, error } = await sb.auth.getUser(token);
+  if (error || !data?.user) return next(new Error('인증 실패'));
+  const studentId = data.user.email.split('@')[0];
+  const nickname = data.user.user_metadata?.display_name || studentId;
+  const { data: roleRow } = await sb.from('user_roles').select('role').eq('student_id', studentId).single();
+  socket.studyUser = { studentId, nickname, role: roleRow?.role || 'student' };
+  next();
+});
+
+function broadcastStudyCount() {
+  io.to(STUDY_ROOM).emit('participant-count', studyParticipants.size);
+  io.to(STUDY_ROOM).emit('participant-list', [...studyParticipants.entries()].map(([id, p]) => ({ id, ...p })));
+}
+
+io.on('connection', (socket) => {
+  socket.emit('participant-count', studyParticipants.size);
+
+  socket.on('join-study', () => {
+    let wasAlreadyIn = false;
+    for (const [otherId, p] of studyParticipants.entries()) {
+      if (otherId !== socket.id && p.studentId === socket.studyUser.studentId) {
+        wasAlreadyIn = true;
+        const oldSocket = io.sockets.sockets.get(otherId);
+        if (oldSocket && oldSocket.connected) {
+          oldSocket.emit('force-leave-study', { reason: '다른 기기에서 입장했어요.' });
+          oldSocket.leave(STUDY_ROOM);
+        }
+        studyParticipants.delete(otherId);
+      }
+    }
+    const alreadyHere = studyParticipants.has(socket.id);
+    socket.join(STUDY_ROOM);
+    studyParticipants.set(socket.id, { studentId: socket.studyUser.studentId, nickname: socket.studyUser.nickname });
+    broadcastStudyCount();
+    if (!wasAlreadyIn && !alreadyHere) {
+      io.to(STUDY_ROOM).emit('chat', { system: true, text: `${socket.studyUser.nickname} 님이 입장했습니다.`, ts: Date.now() });
+    }
+  });
+
+  socket.on('chat', ({ text }) => {
+    const p = studyParticipants.get(socket.id);
+    if (!p || !text) return;
+    io.to(STUDY_ROOM).emit('chat', {
+      id: `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+      studentId: p.studentId, nickname: p.nickname,
+      text: String(text).slice(0, 500), ts: Date.now(),
+    });
+  });
+
+  socket.on('delete-chat', ({ id }) => {
+    if (!isStaffRole(socket.studyUser.role) || !id) return;
+    io.to(STUDY_ROOM).emit('chat-deleted', { id });
+  });
+
+  function leaveStudyRoom() {
+    const p = studyParticipants.get(socket.id);
+    if (p) {
+      studyParticipants.delete(socket.id);
+      io.to(STUDY_ROOM).emit('chat', { system: true, text: `${p.nickname} 님이 퇴장했습니다.`, ts: Date.now() });
+      broadcastStudyCount();
+    }
+  }
+  socket.on('leave-study', leaveStudyRoom);
+  socket.on('disconnect', leaveStudyRoom);
+});
+
+server.listen(PORT, () => {
   console.log(`부광 서버 실행 중 :${PORT}`);
   scheduleDaily();
   scheduleDailyMeal();
