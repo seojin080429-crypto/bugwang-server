@@ -280,38 +280,89 @@ app.post('/api/delete-user', requireAdmin, async (req, res) => {
   res.json({ success: true, message: `${target_student_id}번 계정이 삭제되었습니다` });
 });
 
-// ── API: 급식 정보 ──
-app.get('/api/meal', async (req, res) => {
-  try {
-    const date = req.query.date || new Date().toISOString().slice(0,10).replace(/-/g,'');
-    const url = `https://open.neis.go.kr/hub/mealServiceDietInfo?Type=json&pIndex=1&pSize=10&ATPT_OFCDC_SC_CODE=${EDU_CODE}&SD_SCHUL_CODE=${SCHOOL_CODE}&MLSV_YMD=${date}&KEY=${NEIS_KEY}`;
+// ── 급식 수집 및 저장 (KST 기준) ──
+function kstDate(offsetDays = 0) {
+  const d = new Date(Date.now() + 9 * 60 * 60 * 1000);
+  d.setUTCDate(d.getUTCDate() + offsetDays);
+  return d;
+}
 
-    const data = await new Promise((resolve, reject) => {
-      https.get(url, r => {
-        let d = '';
-        r.on('data', chunk => d += chunk);
-        r.on('end', () => resolve(d));
-      }).on('error', reject);
-    });
+function ymd(d, sep = '') {
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(d.getUTCDate()).padStart(2, '0');
+  return sep ? `${y}${sep}${m}${sep}${day}` : `${y}${m}${day}`;
+}
 
-    const json = JSON.parse(data);
+function thisWeekDates() {
+  const today = kstDate();
+  const dow = today.getUTCDay(); // KST 기준 요일 (0=일 ... 6=토)
+  const mondayOffset = dow === 0 ? -6 : 1 - dow;
+  const dates = [];
+  for (let i = 0; i < 5; i++) dates.push(kstDate(mondayOffset + i));
+  return dates;
+}
 
-    // 급식 없는 날
-    if (json.RESULT?.CODE === 'INFO-000' || !json.mealServiceDietInfo) {
-      return res.json({ meals: [] });
+async function fetchMealForDate(d) {
+  const url = `https://open.neis.go.kr/hub/mealServiceDietInfo?Type=json&pIndex=1&pSize=10&ATPT_OFCDC_SC_CODE=${EDU_CODE}&SD_SCHUL_CODE=${SCHOOL_CODE}&MLSV_YMD=${ymd(d)}&KEY=${NEIS_KEY}`;
+  const data = await new Promise((resolve, reject) => {
+    https.get(url, r => {
+      let body = '';
+      r.on('data', chunk => body += chunk);
+      r.on('end', () => resolve(body));
+    }).on('error', reject);
+  });
+  const json = JSON.parse(data);
+  if (json.RESULT?.CODE === 'INFO-000' || !json.mealServiceDietInfo) return [];
+  const rows = json.mealServiceDietInfo[1]?.row || [];
+  return rows.map(r => ({
+    date: ymd(d, '-'),
+    meal_type: r.MMEAL_SC_NM, // 조식/중식/석식
+    menu: r.DISH_NM.split('<br/>').map(s => s.replace(/\d+\./g, '').trim()).filter(Boolean),
+  }));
+}
+
+async function fetchAndSaveMeal() {
+  console.log('급식 수집 시작:', new Date().toLocaleString('ko-KR'));
+  const dates = thisWeekDates();
+  const allMeals = [];
+  for (const d of dates) {
+    try {
+      allMeals.push(...await fetchMealForDate(d));
+    } catch (e) {
+      console.error(`${ymd(d, '-')} 급식 수집 실패:`, e.message);
     }
+  }
 
-    const rows = json.mealServiceDietInfo[1]?.row || [];
-    const meals = rows.map(r => ({
-      type: r.MMEAL_SC_NM,   // 조식/중식/석식
-      menu: r.DISH_NM.split('<br/>').map(s => s.replace(/\d+\./g,'').trim()).filter(Boolean),
-      cal: r.CAL_INFO,
-      allergy: r.ORPLC_INFO
-    }));
+  const dateStrs = dates.map(d => ymd(d, '-'));
+  await sb.from('meals').delete().in('date', dateStrs);
+  if (allMeals.length > 0) {
+    const { error } = await sb.from('meals').insert(allMeals);
+    if (error) console.error('급식 DB 저장 실패:', error.message);
+    else console.log(`급식 ${allMeals.length}건 저장 완료`);
+  }
+}
 
-    res.json({ meals, date });
-  } catch(e) {
-    console.error('급식 API 오류:', e.message);
+// ── 스케줄러 (매일 오전 6시 KST = UTC 21시) ──
+function scheduleDailyMeal() {
+  const now = new Date();
+  const next = new Date();
+  next.setUTCHours(21, 0, 0, 0);
+  if (next <= now) next.setUTCDate(next.getUTCDate() + 1);
+  const delay = next - now;
+  console.log(`다음 급식 수집: ${next.toLocaleString('ko-KR')} (${Math.round(delay/60000)}분 후)`);
+  setTimeout(() => {
+    fetchAndSaveMeal();
+    setInterval(fetchAndSaveMeal, 24 * 60 * 60 * 1000);
+  }, delay);
+}
+
+// ── API: 급식 수동 수집 ──
+app.post('/api/fetch-meal', requireAdmin, async (req, res) => {
+  try {
+    await fetchAndSaveMeal();
+    res.json({ success: true, message: '급식 정보를 수집했습니다' });
+  } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
@@ -320,5 +371,7 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`부광 서버 실행 중 :${PORT}`);
   scheduleDaily();
+  scheduleDailyMeal();
   fetchAndSaveNews().catch(console.error);
+  fetchAndSaveMeal().catch(console.error);
 });
