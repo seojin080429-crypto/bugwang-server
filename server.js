@@ -36,12 +36,14 @@ const SCHOOL_CODE = '7310046'; // 부광고등학교
 const EDU_CODE    = 'E10';     // 인천광역시교육청
 
 // ── HTTP 요청 헬퍼 ──
+// 응답을 문자열로 바로 이어붙이면 멀티바이트 UTF-8 문자(한글 등)가 청크 경계에서
+// 잘려 깨질 수 있으므로, Buffer로 모았다가 끝에서 한 번에 디코딩한다.
 function httpGet(options) {
   return new Promise((resolve, reject) => {
     const req = https.request(options, res => {
-      let data = '';
-      res.on('data', chunk => data += chunk);
-      res.on('end', () => resolve(data));
+      const chunks = [];
+      res.on('data', chunk => chunks.push(chunk));
+      res.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
     });
     req.on('error', reject);
     req.end();
@@ -51,9 +53,9 @@ function httpGet(options) {
 function httpPost(options, body) {
   return new Promise((resolve, reject) => {
     const req = https.request(options, res => {
-      let data = '';
-      res.on('data', chunk => data += chunk);
-      res.on('end', () => resolve(data));
+      const chunks = [];
+      res.on('data', chunk => chunks.push(chunk));
+      res.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
     });
     req.on('error', reject);
     req.write(body);
@@ -121,9 +123,9 @@ ${articleText}
           'Content-Length': Buffer.byteLength(body)
         }
       }, res => {
-        let data = '';
-        res.on('data', chunk => data += chunk);
-        res.on('end', () => resolve(data));
+        const chunks = [];
+        res.on('data', chunk => chunks.push(chunk));
+        res.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
       });
       req.on('error', reject);
       req.write(body);
@@ -148,13 +150,22 @@ ${articleText}
 }
 
 // ── 뉴스 수집 및 저장 ──
+// 재학 중인 3학년이 치르는 수능은 2026년 11월 시행 "2027학년도" 입시이므로 검색어에 연도를 명시한다.
 const NEWS_QUERIES = [
-  { keyword: '2026 수능 입시', category: '수능' },
-  { keyword: '대학 수시 모집', category: '수시' },
-  { keyword: '대학 정시 모집', category: '정시' },
-  { keyword: '수능 모의고사', category: '모의고사' },
-  { keyword: '대입 학생부종합', category: '학종' },
+  { keyword: '2027학년도 수능 입시', category: '수능' },
+  { keyword: '2027학년도 대학 수시모집', category: '수시' },
+  { keyword: '2027학년도 대학 정시모집', category: '정시' },
+  { keyword: '2027 수능 모의고사', category: '모의고사' },
+  { keyword: '2027학년도 대입 학생부종합', category: '학종' },
 ];
+
+// 검색어에 연도를 넣어도 다른 학년도(예: 2026학년도) 기사가 섞여 들어올 수 있으므로,
+// 제목/설명에 다른 학년도 표기가 있고 2027학년도 언급이 없는 기사는 걸러낸다.
+function isRelevantTo2027(text) {
+  const years = text.match(/20\d{2}학년도/g);
+  if (!years) return true; // 학년도 표기가 없으면 그대로 통과
+  return years.some(y => y.startsWith('2027'));
+}
 
 async function fetchAndSaveNews() {
   console.log('뉴스 수집 시작:', new Date().toLocaleString('ko-KR'));
@@ -174,7 +185,7 @@ async function fetchAndSaveNews() {
         source: stripHtml(item.description || '').slice(0, 200),
         category: q.category,
         published_at: new Date(item.pubDate).toISOString(),
-      }));
+      })).filter(item => isRelevantTo2027(item.title + ' ' + item.source));
       allNews.push(...items);
     } catch(e) {
       console.error(`${q.keyword} 수집 실패:`, e.message);
@@ -214,12 +225,16 @@ function scheduleDaily() {
 async function requireAdmin(req, res, next) {
   const { student_id } = req.body;
   if (!student_id) return res.status(401).json({ error: '학번이 없습니다' });
-  const { data } = await sb.from('user_roles').select('role').eq('student_id', student_id).single();
+  const { data } = await sb.from('user_roles').select('role, is_teacher').eq('student_id', student_id).single();
   const role = data?.role;
-  if (role !== 'admin' && role !== 'owner' && role !== 'teacher') {
+  const isTeacher = !!data?.is_teacher;
+  if (role !== 'admin' && role !== 'owner' && !isTeacher) {
     return res.status(403).json({ error: '권한이 없습니다' });
   }
+  // owner/teacher 둘 다 아니어도(예: admin+is_teacher 조합) 계정 삭제·역할 변경 등
+  // owner 전용 액션은 이 값으로 별도 체크한다.
   req.callerRole = role;
+  req.callerIsOwnerTier = role === 'owner' || isTeacher;
   next();
 }
 
@@ -278,7 +293,7 @@ app.post('/api/create-user', requireAdmin, async (req, res) => {
 
 // ── API: 계정 삭제 ──
 app.post('/api/delete-user', requireAdmin, async (req, res) => {
-  if (!['owner', 'teacher'].includes(req.callerRole)) return res.status(403).json({ error: '운영자/교사만 계정을 삭제할 수 있습니다' });
+  if (!req.callerIsOwnerTier) return res.status(403).json({ error: '운영자/교사만 계정을 삭제할 수 있습니다' });
   const { target_student_id } = req.body;
   if (!target_student_id) return res.status(400).json({ error: '학번이 없습니다' });
   const email = `${target_student_id}@bugwang3-1.app`;
@@ -288,6 +303,13 @@ app.post('/api/delete-user', requireAdmin, async (req, res) => {
   if (!user) return res.status(404).json({ error: '해당 학번의 계정을 찾을 수 없습니다' });
   const { error } = await sb.auth.admin.deleteUser(user.id);
   if (error) return res.status(500).json({ error: error.message });
+  // 계정 삭제 후에도 학번(student_id)으로 연결된 권한/등록기기 기록이 남아있으면
+  // 같은 학번으로 계정을 재생성했을 때 예전 권한이 그대로 부활하므로 함께 삭제한다.
+  await Promise.all([
+    sb.from('user_roles').delete().eq('student_id', target_student_id),
+    sb.from('user_devices').delete().eq('student_id', target_student_id),
+    sb.from('user_profiles').delete().eq('student_id', target_student_id),
+  ]);
   res.json({ success: true, message: `${target_student_id}번 계정이 삭제되었습니다` });
 });
 
