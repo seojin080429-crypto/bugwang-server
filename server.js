@@ -5,6 +5,7 @@ const https = require('https');
 const http = require('http');
 const { Server } = require('socket.io');
 const jwt = require('jsonwebtoken');
+const webpush = require('web-push');
 
 const CORS_ORIGINS = ['https://seojin080429-crypto.github.io', 'http://localhost:3000'];
 
@@ -34,6 +35,40 @@ const STUDY_ROOM        = 'main-camstudy';
 // 학교 정보
 const SCHOOL_CODE = '7310046'; // 부광고등학교
 const EDU_CODE    = 'E10';     // 인천광역시교육청
+
+// ── 웹 푸시 알림 (VAPID) ──
+const VAPID_PUBLIC_KEY  = process.env.VAPID_PUBLIC_KEY;
+const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY;
+if (VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY) {
+  webpush.setVapidDetails('mailto:noreply@bugwang3-1.app', VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
+} else {
+  console.warn('VAPID_PUBLIC_KEY/VAPID_PRIVATE_KEY가 설정되지 않아 푸시 알림이 비활성화됩니다.');
+}
+
+// student_id 목록(null이면 전체 구독자)에게 푸시를 보낸다. 만료/삭제된 구독(410/404)은
+// 그때그때 정리해서 다음부터는 헛수고하지 않게 한다.
+async function sendPushNotification(payload, studentIds) {
+  if (!VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY) return;
+  let q = sb.from('push_subscriptions').select('id,endpoint,p256dh,auth_key,student_id');
+  if (studentIds) q = q.in('student_id', studentIds);
+  const { data: subs } = await q;
+  if (!subs || !subs.length) return;
+  const body = JSON.stringify(payload);
+  await Promise.allSettled(subs.map(async (s) => {
+    try {
+      await webpush.sendNotification(
+        { endpoint: s.endpoint, keys: { p256dh: s.p256dh, auth: s.auth_key } },
+        body
+      );
+    } catch (e) {
+      if (e.statusCode === 404 || e.statusCode === 410) {
+        await sb.from('push_subscriptions').delete().eq('id', s.id);
+      } else {
+        console.error('푸시 발송 실패:', s.student_id, e.statusCode, e.message);
+      }
+    }
+  }));
+}
 
 // ── HTTP 요청 헬퍼 ──
 // 응답을 문자열로 바로 이어붙이면 멀티바이트 UTF-8 문자(한글 등)가 청크 경계에서
@@ -327,6 +362,23 @@ async function requireAuth(req, res, next) {
   req.authUser = data.user;
   next();
 }
+// 이메일은 저장 시 소문자로 정규화되므로(change-student-id에서 겪은 문제와 동일), 대소문자가
+// 보존되는 user_metadata.student_id를 우선 쓰고 없을 때만 이메일에서 유추한다.
+function studentIdOf(authUser) {
+  return authUser.user_metadata?.student_id || authUser.email.split('@')[0];
+}
+// requireAuth 뒤에 붙여서 쓰는 스태프(관리자/운영자/선생님) 전용 게이트 — 공지/선생님메시지
+// 발송처럼 전체 학생에게 푸시가 나가는 액션을 아무나 못 부르게 막는다.
+async function requireStaffAuth(req, res, next) {
+  const sid = studentIdOf(req.authUser);
+  const { data } = await sb.from('user_roles').select('role, is_teacher').eq('student_id', sid).maybeSingle();
+  const role = data?.role;
+  if (role !== 'admin' && role !== 'owner' && !data?.is_teacher) {
+    return res.status(403).json({ error: '권한이 없습니다' });
+  }
+  req.authStudentId = sid;
+  next();
+}
 
 // ── API: 아이디(학번) 변경 — 마이페이지에서 학생이 직접 요청 ──
 // 로그인 이메일이 `{학번}@bugwang3-1.app` 형태이고 student_id가 여러 테이블에서
@@ -373,7 +425,7 @@ app.post('/api/change-student-id', requireAuth, async (req, res) => {
   if (authErr) return res.status(500).json({ error: authErr.message });
 
   // 2) student_id를 텍스트로 들고 있는 테이블들 갱신 (study_tasks는 user_id만 쓰므로 대상 아님)
-  const updateTables = ['user_roles', 'user_profiles', 'simo_members', 'user_devices', 'study_sessions', 'posts', 'comments', 'notice_poll_votes'];
+  const updateTables = ['user_roles', 'user_profiles', 'simo_members', 'user_devices', 'study_sessions', 'posts', 'comments', 'notice_poll_votes', 'push_subscriptions', 'teacher_messages'];
   const results = await Promise.allSettled(
     updateTables.map(t => sb.from(t).update({ student_id: new_student_id }).eq('student_id', oldStudentId))
   );
@@ -393,6 +445,102 @@ app.post('/api/change-student-id', requireAuth, async (req, res) => {
   }
 
   res.json({ success: true, message: `아이디가 ${new_student_id}(으)로 변경되었습니다`, new_student_id });
+});
+
+// ═══════════════════════════════════════════
+// 푸시 알림
+// ═══════════════════════════════════════════
+
+// ── API: 이 기기를 푸시 구독으로 등록 ──
+app.post('/api/push-subscribe', requireAuth, async (req, res) => {
+  const { endpoint, keys, device_label } = req.body;
+  if (!endpoint || !keys?.p256dh || !keys?.auth) return res.status(400).json({ error: '구독 정보가 올바르지 않습니다' });
+  const { error } = await sb.from('push_subscriptions').upsert({
+    user_id: req.authUser.id,
+    student_id: studentIdOf(req.authUser),
+    endpoint, p256dh: keys.p256dh, auth_key: keys.auth,
+    device_label: device_label || null,
+  }, { onConflict: 'endpoint' });
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ success: true });
+});
+
+// ── API: 이 기기의 푸시 구독 해지 ──
+app.post('/api/push-unsubscribe', requireAuth, async (req, res) => {
+  const { endpoint } = req.body;
+  if (!endpoint) return res.status(400).json({ error: 'endpoint가 없습니다' });
+  await sb.from('push_subscriptions').delete().eq('user_id', req.authUser.id).eq('endpoint', endpoint);
+  res.json({ success: true });
+});
+
+// 아래 알림 API들은 제목/내용을 클라이언트가 보낸 문자열을 그대로 믿지 않고, 항상 서버가
+// id로 원본 행을 다시 조회해서 만든다 — 그래야 이 엔드포인트를 직접 두드려서 학급 전체에
+// 임의의 문구로 푸시를 뿌리는 악용을 막을 수 있다.
+
+// ── API: 새 공지사항 알림 (스태프 전용) ──
+app.post('/api/notify/notice', requireAuth, requireStaffAuth, async (req, res) => {
+  const { notice_id } = req.body;
+  if (!notice_id) return res.status(400).json({ error: 'notice_id가 없습니다' });
+  const { data: notice } = await sb.from('notices').select('title,audience').eq('id', notice_id).maybeSingle();
+  if (!notice) return res.status(404).json({ error: '공지를 찾을 수 없습니다' });
+  // 실모반 전용 공지는 실모반원에게만 — 승인된 학생 + 스태프
+  let studentIds = null;
+  if (notice.audience === 'simo') {
+    const [{ data: members }, { data: staff }] = await Promise.all([
+      sb.from('simo_members').select('student_id').eq('status', 'approved'),
+      sb.from('user_roles').select('student_id').or('role.eq.admin,role.eq.owner,is_teacher.eq.true'),
+    ]);
+    studentIds = [...new Set([...(members || []).map(m => m.student_id), ...(staff || []).map(s => s.student_id)])];
+  }
+  sendPushNotification({ title: '새 공지사항', body: notice.title, url: './index.html' }, studentIds).catch(() => {});
+  res.json({ success: true });
+});
+
+// ── API: 내 글/댓글에 달린 새 댓글 알림 (누구나 자기가 실제로 쓴 댓글에 대해서만 호출 가능) ──
+app.post('/api/notify/comment', requireAuth, async (req, res) => {
+  const { comment_id } = req.body;
+  if (!comment_id) return res.status(400).json({ error: 'comment_id가 없습니다' });
+  const { data: comment } = await sb.from('comments').select('post_id,user_id,author_name,content').eq('id', comment_id).maybeSingle();
+  if (!comment || comment.user_id !== req.authUser.id) return res.status(403).json({ error: '본인이 작성한 댓글만 알릴 수 있습니다' });
+  const { data: post } = await sb.from('posts').select('student_id,user_id').eq('id', comment.post_id).maybeSingle();
+  if (!post || post.user_id === comment.user_id) return res.json({ success: true }); // 본인 글엔 본인 댓글 알림 없음
+  sendPushNotification({
+    title: '새 댓글',
+    body: `${comment.author_name}: ${comment.content.slice(0, 60)}`,
+    url: './index.html',
+  }, [post.student_id]).catch(() => {});
+  res.json({ success: true });
+});
+
+// ── API: 공지 투표 참여 알림 (투표를 만든 사람에게) ──
+app.post('/api/notify/poll-vote', requireAuth, async (req, res) => {
+  const { poll_id } = req.body;
+  if (!poll_id) return res.status(400).json({ error: 'poll_id가 없습니다' });
+  const { data: poll } = await sb.from('notice_polls').select('question,created_by').eq('id', poll_id).maybeSingle();
+  if (!poll || !poll.created_by || poll.created_by === req.authUser.id) return res.json({ success: true }); // 본인 투표엔 본인 참여 알림 없음
+  const { data: creatorAuth } = await sb.auth.admin.getUserById(poll.created_by);
+  if (!creatorAuth?.user) return res.json({ success: true });
+  const voterName = studentIdOf(req.authUser);
+  sendPushNotification({
+    title: '투표 참여',
+    body: `"${poll.question}" 투표에 새로운 참여가 있어요`,
+    url: './index.html',
+  }, [studentIdOf(creatorAuth.user)]).catch(() => {});
+  res.json({ success: true });
+});
+
+// ── API: 선생님 메시지 알림 (스태프 전용) ──
+app.post('/api/notify/teacher-message', requireAuth, requireStaffAuth, async (req, res) => {
+  const { message_id } = req.body;
+  if (!message_id) return res.status(400).json({ error: 'message_id가 없습니다' });
+  const { data: msg } = await sb.from('teacher_messages').select('student_id,author_name,content,sender_role').eq('id', message_id).maybeSingle();
+  if (!msg || msg.sender_role !== 'teacher') return res.status(404).json({ error: '메시지를 찾을 수 없습니다' });
+  sendPushNotification({
+    title: `${msg.author_name} 선생님 메시지`,
+    body: msg.content.slice(0, 80),
+    url: './index.html',
+  }, [msg.student_id]).catch(() => {});
+  res.json({ success: true });
 });
 
 // ── 급식 수집 및 저장 (KST 기준) ──
