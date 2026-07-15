@@ -277,12 +277,15 @@ app.post('/api/users', requireAdmin, async (req, res) => {
   res.json({ users: filtered });
 });
 
+// 아이디(학번) 형식 — create-user와 change-student-id가 공유
+const STUDENT_ID_RE = /^[a-zA-Z0-9_-]{2,30}$/;
+
 // ── API: 계정 생성 ──
 app.post('/api/create-user', requireAdmin, async (req, res) => {
   if (!req.callerIsOwnerTier) return res.status(403).json({ error: '운영자/교사만 계정을 생성할 수 있습니다' });
   const { target_student_id, password = '1234' } = req.body;
   if (!target_student_id) return res.status(400).json({ error: '아이디가 없습니다' });
-  if (!/^[a-zA-Z0-9_-]{2,30}$/.test(target_student_id)) return res.status(400).json({ error: '아이디는 영문/숫자/-/_ 2~30자여야 합니다' });
+  if (!STUDENT_ID_RE.test(target_student_id)) return res.status(400).json({ error: '아이디는 영문/숫자/-/_ 2~30자여야 합니다' });
   const email = `${target_student_id}@bugwang3-1.app`;
   const { data, error } = await sb.auth.admin.createUser({
     email, password, email_confirm: true,
@@ -332,26 +335,33 @@ async function requireAuth(req, res, next) {
 // 연결돼 있어서 auth 쪽 uuid가 그대로 유지되는 이번 방식에서는 손댈 필요가 없다.
 app.post('/api/change-student-id', requireAuth, async (req, res) => {
   const { new_student_id } = req.body;
-  const oldStudentId = req.authUser.email.split('@')[0];
+  // 이메일은 Supabase Auth가 저장할 때 소문자로 정규화하므로, 대문자가 섞인 아이디(선생님
+  // 계정 등, 학번과 달리 영문 허용)라면 email.split('@')[0]는 실제 student_id 컬럼에
+  // 저장된 원래 대소문자와 달라진다 — 그 상태로 .eq('student_id', oldStudentId)를 돌리면
+  // 0건 매칭되어 아무 것도 안 바뀌었는데도 에러 없이 "성공"으로 응답할 뻔했다. 프론트의
+  // restoreSession()과 동일하게 원래 대소문자가 보존되는 user_metadata.student_id를
+  // 우선 쓰고, 없을 때만 이메일에서 유추한다.
+  const oldStudentId = req.authUser.user_metadata?.student_id || req.authUser.email.split('@')[0];
   if (!new_student_id) return res.status(400).json({ error: '새 아이디가 없습니다' });
-  if (!/^[a-zA-Z0-9_-]{2,30}$/.test(new_student_id)) return res.status(400).json({ error: '아이디는 영문/숫자/-/_ 2~30자여야 합니다' });
+  if (!STUDENT_ID_RE.test(new_student_id)) return res.status(400).json({ error: '아이디는 영문/숫자/-/_ 2~30자여야 합니다' });
   if (new_student_id === oldStudentId) return res.status(400).json({ error: '현재 아이디와 같습니다' });
 
   const newEmail = `${new_student_id}@bugwang3-1.app`;
 
-  // 이메일(=로그인 아이디) 중복 확인
-  const { data: users, error: listErr } = await sb.auth.admin.listUsers({ perPage: 200 });
+  // 이메일(=로그인 아이디) 중복 확인 + student_id가 기본키인 테이블에 이미 같은 아이디로
+  // 남은 행이 있는지(예: 예전 계정 삭제 시 정리가 안 된 경우, 갱신 시 기본키 충돌 방지) —
+  // 서로 독립적인 조회라 병렬로 처리
+  const pkTables = ['user_roles', 'user_profiles', 'simo_members'];
+  const [{ data: users, error: listErr }, ...pkChecks] = await Promise.all([
+    sb.auth.admin.listUsers({ perPage: 200 }),
+    ...pkTables.map(t => sb.from(t).select('student_id').eq('student_id', new_student_id).maybeSingle()),
+  ]);
   if (listErr) return res.status(500).json({ error: listErr.message });
   if (users.users.some(u => u.email === newEmail)) {
     return res.status(409).json({ error: '이미 사용 중인 아이디예요' });
   }
-
-  // student_id가 기본키인 테이블에 이미 같은 아이디로 남은 행이 있으면(예: 예전 계정 삭제 시
-  // 정리가 안 된 경우) 갱신 시 기본키 충돌이 나므로 미리 확인
-  const pkTables = ['user_roles', 'user_profiles', 'simo_members'];
-  for (const t of pkTables) {
-    const { data: existing } = await sb.from(t).select('student_id').eq('student_id', new_student_id).maybeSingle();
-    if (existing) return res.status(409).json({ error: '이미 사용 중인 아이디예요' });
+  if (pkChecks.some(c => c.data)) {
+    return res.status(409).json({ error: '이미 사용 중인 아이디예요' });
   }
 
   // 1) 로그인 이메일(= 아이디) 변경
@@ -363,23 +373,21 @@ app.post('/api/change-student-id', requireAuth, async (req, res) => {
   if (authErr) return res.status(500).json({ error: authErr.message });
 
   // 2) student_id를 텍스트로 들고 있는 테이블들 갱신 (study_tasks는 user_id만 쓰므로 대상 아님)
-  const results = await Promise.allSettled([
-    sb.from('user_roles').update({ student_id: new_student_id }).eq('student_id', oldStudentId),
-    sb.from('user_profiles').update({ student_id: new_student_id }).eq('student_id', oldStudentId),
-    sb.from('simo_members').update({ student_id: new_student_id }).eq('student_id', oldStudentId),
-    sb.from('user_devices').update({ student_id: new_student_id }).eq('student_id', oldStudentId),
-    sb.from('study_sessions').update({ student_id: new_student_id }).eq('student_id', oldStudentId),
-    sb.from('posts').update({ student_id: new_student_id }).eq('student_id', oldStudentId),
-    sb.from('comments').update({ student_id: new_student_id }).eq('student_id', oldStudentId),
-    sb.from('notice_poll_votes').update({ student_id: new_student_id }).eq('student_id', oldStudentId),
-  ]);
-  const failed = results.filter(r => r.status === 'rejected' || r.value?.error);
-  if (failed.length) {
-    console.error('아이디 변경 중 일부 테이블 갱신 실패:', failed.map(f => f.reason || f.value?.error));
+  const updateTables = ['user_roles', 'user_profiles', 'simo_members', 'user_devices', 'study_sessions', 'posts', 'comments', 'notice_poll_votes'];
+  const results = await Promise.allSettled(
+    updateTables.map(t => sb.from(t).update({ student_id: new_student_id }).eq('student_id', oldStudentId))
+  );
+  const failedTables = updateTables.filter((t, i) => results[i].status === 'rejected' || results[i].value?.error);
+  if (failedTables.length) {
+    console.error('아이디 변경 중 일부 테이블 갱신 실패:', failedTables, results.map(r => r.reason || r.value?.error));
+    // user_roles가 실패하면 이 계정의 관리자/선생님 권한이 새 아이디로 안 옮겨져서
+    // requireAdmin이 새 아이디로는 권한을 못 찾는 상태가 됨 — 별도로 강조해서 안내
+    const roleWarning = failedTables.includes('user_roles') ? ' 특히 권한(관리자/선생님) 정보가 아직 예전 아이디에 남아있을 수 있어요.' : '';
     return res.status(207).json({
       success: true,
       partial: true,
-      message: '로그인 아이디는 바뀌었지만 일부 기록은 갱신하지 못했어요. 관리자에게 문의해주세요.',
+      failed_tables: failedTables,
+      message: `로그인 아이디는 바뀌었지만 일부 기록(${failedTables.join(', ')})은 갱신하지 못했어요.${roleWarning} 관리자에게 문의해주세요.`,
       new_student_id,
     });
   }
