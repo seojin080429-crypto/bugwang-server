@@ -314,6 +314,79 @@ app.post('/api/delete-user', requireAdmin, async (req, res) => {
   res.json({ success: true, message: `${target_student_id}번 계정이 삭제되었습니다` });
 });
 
+// ── 로그인한 본인 확인 미들웨어 (관리자 권한 불필요, access_token만 검증) ──
+async function requireAuth(req, res, next) {
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+  if (!token) return res.status(401).json({ error: '로그인이 필요합니다' });
+  const { data, error } = await sb.auth.getUser(token);
+  if (error || !data?.user) return res.status(401).json({ error: '세션이 만료되었습니다. 다시 로그인해주세요' });
+  req.authUser = data.user;
+  next();
+}
+
+// ── API: 아이디(학번) 변경 — 마이페이지에서 학생이 직접 요청 ──
+// 로그인 이메일이 `{학번}@bugwang3-1.app` 형태이고 student_id가 여러 테이블에서
+// (실제 FK 제약 없이) 텍스트로 그대로 쓰이고 있어서, 바꿀 때 이메일과 관련 테이블을
+// 한 번에 일관되게 갱신해야 함. study_tasks는 student_id 컬럼이 없이 user_id(uuid)로만
+// 연결돼 있어서 auth 쪽 uuid가 그대로 유지되는 이번 방식에서는 손댈 필요가 없다.
+app.post('/api/change-student-id', requireAuth, async (req, res) => {
+  const { new_student_id } = req.body;
+  const oldStudentId = req.authUser.email.split('@')[0];
+  if (!new_student_id) return res.status(400).json({ error: '새 아이디가 없습니다' });
+  if (!/^[a-zA-Z0-9_-]{2,30}$/.test(new_student_id)) return res.status(400).json({ error: '아이디는 영문/숫자/-/_ 2~30자여야 합니다' });
+  if (new_student_id === oldStudentId) return res.status(400).json({ error: '현재 아이디와 같습니다' });
+
+  const newEmail = `${new_student_id}@bugwang3-1.app`;
+
+  // 이메일(=로그인 아이디) 중복 확인
+  const { data: users, error: listErr } = await sb.auth.admin.listUsers({ perPage: 200 });
+  if (listErr) return res.status(500).json({ error: listErr.message });
+  if (users.users.some(u => u.email === newEmail)) {
+    return res.status(409).json({ error: '이미 사용 중인 아이디예요' });
+  }
+
+  // student_id가 기본키인 테이블에 이미 같은 아이디로 남은 행이 있으면(예: 예전 계정 삭제 시
+  // 정리가 안 된 경우) 갱신 시 기본키 충돌이 나므로 미리 확인
+  const pkTables = ['user_roles', 'user_profiles', 'simo_members'];
+  for (const t of pkTables) {
+    const { data: existing } = await sb.from(t).select('student_id').eq('student_id', new_student_id).maybeSingle();
+    if (existing) return res.status(409).json({ error: '이미 사용 중인 아이디예요' });
+  }
+
+  // 1) 로그인 이메일(= 아이디) 변경
+  const { error: authErr } = await sb.auth.admin.updateUserById(req.authUser.id, {
+    email: newEmail,
+    email_confirm: true,
+    user_metadata: { ...req.authUser.user_metadata, student_id: new_student_id },
+  });
+  if (authErr) return res.status(500).json({ error: authErr.message });
+
+  // 2) student_id를 텍스트로 들고 있는 테이블들 갱신 (study_tasks는 user_id만 쓰므로 대상 아님)
+  const results = await Promise.allSettled([
+    sb.from('user_roles').update({ student_id: new_student_id }).eq('student_id', oldStudentId),
+    sb.from('user_profiles').update({ student_id: new_student_id }).eq('student_id', oldStudentId),
+    sb.from('simo_members').update({ student_id: new_student_id }).eq('student_id', oldStudentId),
+    sb.from('user_devices').update({ student_id: new_student_id }).eq('student_id', oldStudentId),
+    sb.from('study_sessions').update({ student_id: new_student_id }).eq('student_id', oldStudentId),
+    sb.from('posts').update({ student_id: new_student_id }).eq('student_id', oldStudentId),
+    sb.from('comments').update({ student_id: new_student_id }).eq('student_id', oldStudentId),
+    sb.from('notice_poll_votes').update({ student_id: new_student_id }).eq('student_id', oldStudentId),
+  ]);
+  const failed = results.filter(r => r.status === 'rejected' || r.value?.error);
+  if (failed.length) {
+    console.error('아이디 변경 중 일부 테이블 갱신 실패:', failed.map(f => f.reason || f.value?.error));
+    return res.status(207).json({
+      success: true,
+      partial: true,
+      message: '로그인 아이디는 바뀌었지만 일부 기록은 갱신하지 못했어요. 관리자에게 문의해주세요.',
+      new_student_id,
+    });
+  }
+
+  res.json({ success: true, message: `아이디가 ${new_student_id}(으)로 변경되었습니다`, new_student_id });
+});
+
 // ── 급식 수집 및 저장 (KST 기준) ──
 function kstDate(offsetDays = 0) {
   const d = new Date(Date.now() + 9 * 60 * 60 * 1000);
