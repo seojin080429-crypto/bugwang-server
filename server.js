@@ -543,6 +543,27 @@ app.post('/api/notify/teacher-message', requireAuth, requireStaffAuth, async (re
   res.json({ success: true });
 });
 
+// ── API: DM 새 메시지 알림 (보낸 사람 본인만 호출 가능, 나머지 참가자에게 발송) ──
+app.post('/api/notify/dm-message', requireAuth, async (req, res) => {
+  const { message_id } = req.body;
+  if (!message_id) return res.status(400).json({ error: 'message_id가 없습니다' });
+  const { data: msg } = await sb.from('dm_messages').select('room_id,sender_user_id,sender_name,content,image_url').eq('id', message_id).maybeSingle();
+  // 호출자가 실제 이 메시지의 발신자인지 확인 — 아니면 남의 메시지를 빌미로 임의 알림을 보낼 수 있음
+  if (!msg || msg.sender_user_id !== req.authUser.id) return res.status(403).json({ error: '본인이 보낸 메시지만 알릴 수 있습니다' });
+  const [{ data: room }, { data: participants }] = await Promise.all([
+    sb.from('dm_rooms').select('is_group,name').eq('id', msg.room_id).maybeSingle(),
+    sb.from('dm_participants').select('student_id,user_id').eq('room_id', msg.room_id),
+  ]);
+  const recipientIds = (participants || [])
+    .filter(p => p.user_id !== req.authUser.id)
+    .map(p => p.student_id);
+  if (!recipientIds.length) return res.json({ success: true });
+  const title = room?.is_group ? `${msg.sender_name} (${room.name || '단톡방'})` : msg.sender_name;
+  const body = msg.image_url ? '📷 사진을 보냈어요' : (msg.content || '').slice(0, 80);
+  sendPushNotification({ title, body, url: './index.html' }, recipientIds).catch(() => {});
+  res.json({ success: true });
+});
+
 // ── 급식 수집 및 저장 (KST 기준) ──
 function kstDate(offsetDays = 0) {
   const d = new Date(Date.now() + 9 * 60 * 60 * 1000);
