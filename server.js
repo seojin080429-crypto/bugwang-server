@@ -755,6 +755,26 @@ function broadcastStudyCount() {
 
 io.on('connection', (socket) => {
   socket.emit('participant-count', studyParticipants.size);
+  // 같은 학생의 다른 기기(폰/PC)끼리만 타이머 상태를 주고받는 개인 룸
+  socket.join(`user:${socket.studyUser.studentId}`);
+
+  // 학습 플래너 타이머: 상태가 바뀔 때만(시작/일시정지/재개/정지) 클라이언트가 emit하고,
+  // 서버는 같은 학생의 다른 기기로만 그대로 릴레이한다. 매초 카운트를 보내는 게 아니라
+  // start_timestamp/accumulated_seconds/status만 오가므로 받는 쪽에서 Date.now() 기준으로
+  // 알아서 재계산한다.
+  socket.on('timer-sync', (state) => {
+    if (!state || typeof state !== 'object') return;
+    const { sessionId, subject, taskName, startTimestamp, accumulatedSeconds, status } = state;
+    if (status !== 'running' && status !== 'paused' && status !== 'stopped') return;
+    socket.to(`user:${socket.studyUser.studentId}`).emit('timer-sync', {
+      sessionId: sessionId ?? null,
+      subject: typeof subject === 'string' ? subject.slice(0, 100) : null,
+      taskName: typeof taskName === 'string' ? taskName.slice(0, 100) : null,
+      startTimestamp: Number.isFinite(startTimestamp) ? startTimestamp : null,
+      accumulatedSeconds: Number.isFinite(accumulatedSeconds) ? accumulatedSeconds : 0,
+      status,
+    });
+  });
 
   socket.on('join-study', () => {
     let wasAlreadyIn = false;
