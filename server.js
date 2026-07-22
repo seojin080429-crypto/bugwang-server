@@ -70,6 +70,29 @@ async function sendPushNotification(payload, studentIds) {
   }));
 }
 
+// 알림센터(프론트 종모양 드롭다운)용 영구 알림 로그에 기록한다. sendPushNotification과 달리
+// "그 순간 푸시를 구독 중인 기기"가 아니라 이 이벤트를 볼 자격이 있는 학생 전원에게 남겨야
+// 하므로, studentIds가 null이면(=푸시 쪽에서 "전체 구독자"를 뜻하던 것과 달리 여기선) 학급
+// 전체 명단(user_roles)을 대상으로 한다. notifications.recipient_user_id는 RLS의
+// auth.uid() 매칭용이라 user_profiles에서 student_id→user_id를 찾아야 하는데, 프로필을 아직
+// 안 만든(마이페이지 이름 설정을 안 끝낸) 학생은 매칭이 안 되므로 그런 대상은 조용히 건너뛴다.
+async function insertNotifications(type, title, body, studentIds, link) {
+  let ids = studentIds;
+  if (!ids) {
+    const { data: roster } = await sb.from('user_roles').select('student_id');
+    ids = (roster || []).map(r => r.student_id);
+  }
+  if (!ids || !ids.length) return;
+  const { data: profiles } = await sb.from('user_profiles').select('student_id,user_id').in('student_id', ids);
+  const rows = (profiles || []).map(p => ({
+    recipient_student_id: p.student_id, recipient_user_id: p.user_id,
+    type, title, body, link: link || null,
+  }));
+  if (!rows.length) return;
+  const { error } = await sb.from('notifications').insert(rows);
+  if (error) console.error('알림센터 기록 실패:', type, error.message);
+}
+
 // ── HTTP 요청 헬퍼 ──
 // 응답을 문자열로 바로 이어붙이면 멀티바이트 UTF-8 문자(한글 등)가 청크 경계에서
 // 잘려 깨질 수 있으므로, Buffer로 모았다가 끝에서 한 번에 디코딩한다.
@@ -493,6 +516,7 @@ app.post('/api/notify/notice', requireAuth, requireStaffAuth, async (req, res) =
     studentIds = [...new Set([...(members || []).map(m => m.student_id), ...(staff || []).map(s => s.student_id)])];
   }
   sendPushNotification({ title: '새 공지사항', body: notice.title, url: './index.html' }, studentIds).catch(() => {});
+  insertNotifications('notice', '새 공지사항', notice.title, studentIds, 'notice').catch(() => {});
   res.json({ success: true });
 });
 
@@ -502,13 +526,12 @@ app.post('/api/notify/comment', requireAuth, async (req, res) => {
   if (!comment_id) return res.status(400).json({ error: 'comment_id가 없습니다' });
   const { data: comment } = await sb.from('comments').select('post_id,user_id,author_name,content').eq('id', comment_id).maybeSingle();
   if (!comment || comment.user_id !== req.authUser.id) return res.status(403).json({ error: '본인이 작성한 댓글만 알릴 수 있습니다' });
-  const { data: post } = await sb.from('posts').select('student_id,user_id').eq('id', comment.post_id).maybeSingle();
+  const { data: post } = await sb.from('posts').select('student_id,user_id,category').eq('id', comment.post_id).maybeSingle();
   if (!post || post.user_id === comment.user_id) return res.json({ success: true }); // 본인 글엔 본인 댓글 알림 없음
-  sendPushNotification({
-    title: '새 댓글',
-    body: `${comment.author_name}: ${comment.content.slice(0, 60)}`,
-    url: './index.html',
-  }, [post.student_id]).catch(() => {});
+  const body = `${comment.author_name}: ${comment.content.slice(0, 60)}`;
+  sendPushNotification({ title: '새 댓글', body, url: './index.html' }, [post.student_id]).catch(() => {});
+  const BOARD_LINK = { free: 'free-board', qna: 'qna-board', bug: 'bug-report' };
+  insertNotifications('comment', '새 댓글', body, [post.student_id], BOARD_LINK[post.category] || 'free-board').catch(() => {});
   res.json({ success: true });
 });
 
@@ -520,12 +543,10 @@ app.post('/api/notify/poll-vote', requireAuth, async (req, res) => {
   if (!poll || !poll.created_by || poll.created_by === req.authUser.id) return res.json({ success: true }); // 본인 투표엔 본인 참여 알림 없음
   const { data: creatorAuth } = await sb.auth.admin.getUserById(poll.created_by);
   if (!creatorAuth?.user) return res.json({ success: true });
-  const voterName = studentIdOf(req.authUser);
-  sendPushNotification({
-    title: '투표 참여',
-    body: `"${poll.question}" 투표에 새로운 참여가 있어요`,
-    url: './index.html',
-  }, [studentIdOf(creatorAuth.user)]).catch(() => {});
+  const voteBody = `"${poll.question}" 투표에 새로운 참여가 있어요`;
+  const creatorStudentId = studentIdOf(creatorAuth.user);
+  sendPushNotification({ title: '투표 참여', body: voteBody, url: './index.html' }, [creatorStudentId]).catch(() => {});
+  insertNotifications('poll-vote', '투표 참여', voteBody, [creatorStudentId], 'notice').catch(() => {});
   res.json({ success: true });
 });
 
@@ -535,11 +556,10 @@ app.post('/api/notify/teacher-message', requireAuth, requireStaffAuth, async (re
   if (!message_id) return res.status(400).json({ error: 'message_id가 없습니다' });
   const { data: msg } = await sb.from('teacher_messages').select('student_id,author_name,content,sender_role').eq('id', message_id).maybeSingle();
   if (!msg || msg.sender_role !== 'teacher') return res.status(404).json({ error: '메시지를 찾을 수 없습니다' });
-  sendPushNotification({
-    title: `${msg.author_name} 선생님 메시지`,
-    body: msg.content.slice(0, 80),
-    url: './index.html',
-  }, [msg.student_id]).catch(() => {});
+  const title = `${msg.author_name} 선생님 메시지`;
+  const body = msg.content.slice(0, 80);
+  sendPushNotification({ title, body, url: './index.html' }, [msg.student_id]).catch(() => {});
+  insertNotifications('teacher-message', title, body, [msg.student_id], 'mypage').catch(() => {});
   res.json({ success: true });
 });
 
@@ -561,6 +581,24 @@ app.post('/api/notify/dm-message', requireAuth, async (req, res) => {
   const title = room?.is_group ? `${msg.sender_name} (${room.name || '단톡방'})` : msg.sender_name;
   const body = msg.image_url ? '📷 사진을 보냈어요' : (msg.content || '').slice(0, 80);
   sendPushNotification({ title, body, url: './index.html' }, recipientIds).catch(() => {});
+  insertNotifications('dm-message', title, body, recipientIds, 'dm').catch(() => {});
+  res.json({ success: true });
+});
+
+// ── API: 캠스터디 참여 알림 (참여한 본인을 뺀 학급 전체에게 방송) ──
+// 호출자 본인 확인만 하고(requireAuth) 별도 파라미터는 받지 않음 — "누가 참여했다"는 사실 자체는
+// 토큰의 주인이 곧 당사자이므로 클라이언트가 보낸 이름/학번을 믿을 필요가 없다.
+app.post('/api/notify/camstudy-join', requireAuth, async (req, res) => {
+  const studentId = studentIdOf(req.authUser);
+  const { data: profile } = await sb.from('user_profiles').select('display_name').eq('student_id', studentId).maybeSingle();
+  const name = profile?.display_name || `${studentId}번`;
+  const { data: roster } = await sb.from('user_roles').select('student_id');
+  const recipientIds = (roster || []).map(r => r.student_id).filter(sid => sid !== studentId);
+  if (!recipientIds.length) return res.json({ success: true });
+  const title = '캠스터디';
+  const body = `${name}님이 캠스터디에 참여하고 있어요`;
+  sendPushNotification({ title, body, url: './index.html' }, recipientIds).catch(() => {});
+  insertNotifications('camstudy-join', title, body, recipientIds, 'camstudy').catch(() => {});
   res.json({ success: true });
 });
 
